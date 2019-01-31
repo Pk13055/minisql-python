@@ -24,6 +24,12 @@ select col1 from table_name;
 select max(col1) from table1;
 ```
 
+## Operators and Specification
+
+- In the where queries, there would be a maximum of one AND/OR operator
+with no NOT operators.
+- Relational operators that are to be handled in the assignment, the operators include < , >, <=, >=, =.
+
 ## Examples
 
 1. Select * from table2;
