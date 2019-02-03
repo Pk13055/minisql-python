@@ -32,6 +32,8 @@ class QueryParser(object):
         self.tables = tables
         self.idt = idt
         self.meta = meta
+        self.parse_col = lambda val: val.split('.') if '.' in val else [None, val]
+
 
         self.query = None
         self.res = None
@@ -64,8 +66,63 @@ class QueryParser(object):
             print(f"sqlerror: {e}")
             return False
 
-    @staticmethod
-    def analyze_tokens(base: list) -> list:
+    def parse_function(self, fn: sqlparse.sql.Function) -> list:
+        """Parses the function token to extract table and function
+
+        :param fn_token: sqlparse.sql.Function -> the function token
+        :return simple_token: list[list] -> the list of function and
+        normalized column name
+        """
+        col_name = fn.get_parameters()[0].normalized
+        return [fn.get_name(), self.parse_col(col_name)]
+
+    def parse_fields(self, base: list, columns: list) -> list:
+        """Parses the fields into a workable format
+
+        :param base: base field params
+        :param columns: valid columns
+        :return fields: list -> A list of the format
+            - [
+                {
+                    field: 'tableX.A',
+                    function: 'foo' or NONE or distinct
+                }, ...
+            ]
+        """
+        tokens = []
+        skip = False
+        try:
+            for idx, token in enumerate(base):
+                simple_token = []
+                if skip is True:
+                    skip = False
+                    continue
+                if token.ttype == sqlparse.tokens.Keyword:
+                    simple_token = [token.normalized, self.parse_col(base[idx + 1].normalized)]
+                    skip = True
+                elif isinstance(token, sqlparse.sql.Function):
+                    simple_token = self.parse_function(token)
+                else:
+                    simple_token = self.parse_col(token.normalized)
+                tokens.append(simple_token)
+        except Exception as e:
+            print(f"tokenerror: unsupported format | {e}")
+            tokens = []
+        return tokens
+
+    def parse_where(self, base: list) -> list:
+        """Parses the where section to extract join params
+
+        :param base: list -> Base set of tokens to parse from
+        This contains the raw where statement
+        :return where_sec: dict -> where part of the `simplified_tokens`
+        that contains any possible comparisons
+        """
+        where_sec = {}
+        print(base)
+        return where_sec
+
+    def analyze_tokens(self, base: list) -> dict:
         """Analyse tokens and parse them into a simple list
         :param base: list[sqlparse.tokens] -> base set of sqlparse tokens
         :return simplified_tokens: list[str] -> simple token system token
@@ -77,9 +134,42 @@ class QueryParser(object):
                 - joined by at most one AND/OR
                 [['table1', 'table2', ...], [tableX.colY, func(...), ...], ]
         """
-        simplified_tokens = []
-        print(base)
+
+        simplified_tokens = {}
+        last_token = base[-1]  # either a WHERE statement or a punctutation
+        table_list = base[-2]  # tables being referenced for the columns
+        fields = base[:-3]  # a list of fields and functions being used
+
+        # check whether tables exist
+        table_list = [_ for _ in table_list if _.ttype not in [
+            sqlparse.tokens.Punctuation, sqlparse.tokens.Whitespace]]
+        if not all([_.normalized in self.tables for _ in table_list]):
+            raise Exception(f"sqlerror: Missing table referenced")
+
+        simplified_tokens['tables'] = [_.normalized for _ in table_list]
+        valid_columns = set(chain(*[self.meta[_.normalized] for _ in table_list]))
+
+        # parse fields to retrieve
+        fields = [_ for ls in fields for _ in ls if _.ttype not in
+                  [sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation]]
+        simplified_tokens['fields'] = self.parse_fields(fields, valid_columns)
+
+        # parse where section if exists
+        if last_token.ttype != sqlparse.tokens.Punctuation:
+            simplified_tokens['where'] = self.parse_where(last_token)
         return simplified_tokens
+
+
+    def compile_result(self, tokens: list) -> str:
+        """Compile the results after verifying valid statement
+        Handle the where condition and comparators and actual data fetching
+
+        :param tokens: list -> simplified list of tokens to parse
+        :return res: str -> Resulting formatted result depending on the query
+        """
+        res = ""
+        printj(tokens)
+        return res
 
     def parse(self, query: sqlparse.sql.Statement) -> str:
         """Parses a single query and returns the result.
@@ -89,7 +179,6 @@ class QueryParser(object):
         :return result: str -> the record result to be parsed
         """
         # TODO: add query parsing here (only select statements supported)
-        print(query)
         res = ""
 
         # Note: self.query and res contain the result and query that
@@ -97,11 +186,15 @@ class QueryParser(object):
         if query[0].normalized == "SELECT" and query[-1].normalized[-1] == ';':
             self.query = query
             base = [_ for _ in self.query if _.normalized != ' ']
-            tokens = self.analyze_tokens(base[1:])
-            # TODO: update self.query to contain the final simplified token list
+            try:
+                tokens = self.analyze_tokens(base[1:])
+                res = self.compile_result(tokens)
+                self.query = query
+            except Exception as e:
+                print(f"[LOOKUP_ERROR] {e}")
         else:
-            res = f"sqlerror: unsupported statement {self.query}"
-            print(res)
+            res = f"sqlerror: unsupported statement {self.query} (NOT_SELECT)"
+        print(res)
         self.history.append(res)
         return res
 
