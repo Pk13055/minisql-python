@@ -196,7 +196,6 @@ class QueryParser(object):
         last_token = base[-1]  # either a WHERE statement or a punctutation
         table_list = base[-2]  # tables being referenced for the columns
         fields = base[:-3]  # a list of fields and functions being used
-
         # check whether tables exist
         table_list = [_ for _ in table_list if _.ttype not in [
             sqlparse.tokens.Punctuation, sqlparse.tokens.Whitespace]]
@@ -207,9 +206,12 @@ class QueryParser(object):
         valid_columns = set(chain(*[self.meta[_.normalized] for _ in table_list]))
 
         # parse fields to retrieve
-        fields = [_ for ls in fields for _ in ls if _.ttype not in
-                  [sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation]]
-        simplified_tokens['fields'] = self.parse_fields(fields, valid_columns)
+        if fields[0].ttype == sqlparse.tokens.Token.Wildcard:
+            simplified_tokens['fields'] = [[None, '*']]
+        else:
+            fields = [_ for ls in fields for _ in ls if _.ttype not in
+                    [sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation]]
+            simplified_tokens['fields'] = self.parse_fields(fields, valid_columns)
 
         # parse where section if exists
         if last_token.ttype != sqlparse.tokens.Punctuation:
@@ -219,7 +221,9 @@ class QueryParser(object):
     def normalize_col(self, val, rev=False):
         table, col = val
         cur_token = []
-        if table is None:
+        if col == "*":
+            cur_token = [None]
+        elif table is None:
             valid_tables = [self.tables[_] for _ in self.idt[col]]
             cur_token.append(valid_tables[0 if not rev else -1])
             if len(valid_tables) == 0:
@@ -269,7 +273,7 @@ class QueryParser(object):
         tokens['conditions'] = norm_tokens
         return tokens
 
-    def gen_result(self, fields: list, where: dict, dataset: list, tables: list) -> str:
+    def gen_result(self, fields: list, where: dict, dataset: list, tables: list) -> dict:
         """Generate the final result query
 
         :param fields: list -> list of normalized fields
@@ -277,21 +281,31 @@ class QueryParser(object):
         :param dataset: list -> dataset to process on
         :return res: str -> final result
         """
-        res = ""
         queryset = {}
         result = {}
         for data_gp, table in zip(dataset, tables):
             cols = self.meta[table]
-            queryset[table] = {col: [table + '.' + col] for col in cols}
+            queryset[table] = {col: [] for col in cols}
             for row in data_gp:
-                [queryset[table][col].append(val) for col, val in zip(cols, row)]
+                [queryset[table][col].append(int(val)) for col, val in zip(cols, row)]
         for field in fields:
             keyword, table, col = field
+            if col == "*":
+                for table in tables:
+                    for col in queryset[table]:
+                        result[table + '.' + col] = queryset[table][col]
+                break
             base_col = queryset[table][col]
-            result['.'.join([table, col])] = base_col
-            if keyword == 'DISTINCT':
-                pass
-        return res
+            if keyword == "DISTINCT":
+                result[f"{keyword}({table}.{col})"] = base_col
+            elif keyword and keyword.lower() in ['min', 'max', 'avg', 'sum']:
+                fn = eval(keyword)
+                query_val = fn(base_col)
+                idxs = [idx for idx, _ in enumerate(base_col) if _ == query_val]
+                result[f"{keyword}({table}.{col})"] = base_col
+            else:
+                result[table + '.' + col] = base_col
+        return result
 
     def filter_where(self, dataset: list, where: dict) -> list:
         """Filter the where joins and reduce data size
@@ -304,6 +318,31 @@ class QueryParser(object):
         new_data = dataset  # TODO: filter on the basis of conditionals
         return new_data
 
+    def print_result(self, json: dict, fields: list, verbose=True) -> list:
+        """Prints the result given a formatted dict"""
+        res_ = []
+        header = []
+        for field in fields:
+            keyword, table, col = field
+            if col == "*":
+                res_ = [json[k] for k in json]
+                header = list(json.keys())
+                break
+            if keyword is not None:
+                header.append(f"{keyword}({table}.{col})")
+            else:
+                header.append(f"{table}.{col}")
+            res_.append(json[header[-1]])
+        res_ = list(map(list, zip(*res_)))
+        header_string = '.'.join(header)
+        body = ""
+        for row in res_[1:]:
+            body += "\n" + str(row)[1:-1]
+        res = header_string + body
+        if verbose:
+            print(res)
+        return res
+
     def compile_result(self, tokens: list) -> str:
         """Compile the results after verifying valid statement
         Handle the where condition and comparators and actual data fetching
@@ -311,7 +350,6 @@ class QueryParser(object):
         :param tokens: list -> simplified list of tokens to parse
         :return res: str -> Resulting formatted result depending on the query
         """
-        res = ""
         valid_tables = self.tables
         idt = self.idt
         tables, fields = tokens['tables'], tokens['fields']
@@ -325,10 +363,10 @@ class QueryParser(object):
             where = self.normalize_where(tokens['where'], tables)
             dataset = self.filter_where(dataset, where)
         try:
-            res = self.gen_result(fields, where, dataset, tables)
+            result = self.gen_result(fields, where, dataset, tables)
         except Exception as e:
             print(f"dataerror: invalid query | {e}")
-        return res
+        return self.print_result(result, fields)
 
     def parse(self, query: sqlparse.sql.Statement) -> str:
         """Parses a single query and returns the result.
@@ -337,8 +375,6 @@ class QueryParser(object):
         :param query: sqlparse statment -> The query to be parsed
         :return result: str -> the record result to be parsed
         """
-        res = ""
-
         # Note: self.query and res contain the result and query that
         # was last executed successfully
         if query[0].normalized == "SELECT" and query[-1].normalized[-1] == ';':
@@ -352,7 +388,7 @@ class QueryParser(object):
                 print(f"[LOOKUP_ERROR] {e}")
         else:
             res = f"sqlerror: unsupported statement {self.query} (NOT_SELECT)"
-        print(res)
+        self.result = res
         self.history.append(res)
         return res
 
