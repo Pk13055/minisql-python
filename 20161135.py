@@ -131,7 +131,7 @@ class QueryParser(object):
             has a standard format
             [
                 {
-                    'type' : 'COMP' OR 'NUM'
+                    'type' : 'JOIN' OR 'NUM'
                     'lhs' : [None or 'table', 'col'],
                     'rhs' : [None or 'table', 'col'] OR NUM,
                     'op'  : 'LT', 'GT', 'EQ', 'LTE', 'GTE'
@@ -149,10 +149,12 @@ class QueryParser(object):
                 elif isinstance(token, sqlparse.sql.Identifier):
                     value = self.parse_col(token.normalized)
                     cur_token['rhs' if 'lhs' in cur_token else 'lhs'] = value
+                    cur_token['type'] = 'JOIN'
                     is_first = False
                 elif token.ttype in [sqlparse.tokens.Token.Literal.Number.Integer,
                                      sqlparse.tokens.Token.Literal.Number.Float]:
                     cur_token['rhs'] = float(token.normalized)
+                    cur_token['type'] = 'NUM'
             return cur_token
 
         simple_comp = [parse_condition(token) for token in tokens]
@@ -171,7 +173,7 @@ class QueryParser(object):
         if len(tokens) < 4:
             comparisons = tokens[::2]
             joins = tokens[1::2]
-            where_sec['condtions'] = self.parse_conditions(comparisons)
+            where_sec['conditions'] = self.parse_conditions(comparisons)
             where_sec['joins'] = self.parse_joins(joins)
         else:
             raise Exception("whereerror: unsupported where statement")
@@ -214,6 +216,93 @@ class QueryParser(object):
             simplified_tokens['where'] = self.parse_where(last_token)
         return simplified_tokens
 
+    def normalize_col(self, val, rev=False):
+        table, col = val
+        cur_token = []
+        if table is None:
+            valid_tables = [self.tables[_] for _ in self.idt[col]]
+            cur_token.append(valid_tables[0 if not rev else -1])
+            if len(valid_tables) == 0:
+                raise Exception(f"colerror: invalid column referenced")
+        else:
+            cur_token.append(table)
+        cur_token.append(col)
+        return cur_token
+
+    def normalize_fields(self, fields: list, tables: list) -> list:
+        """Normalizes fields and adds the column name as well
+
+        :param fields: list -> list of fields
+        :param tables: list -> list of tables
+        :return norm_list: list -> same format as previous with everything filled
+        """
+        norm_tokens = []
+        keywords = ['sum', 'min', 'max', 'avg', 'DISTINCT']
+        keywords += [_.upper() for _ in keywords]
+        for col in fields:
+            cur_token = []
+            if any(isinstance(_, list) for _ in col):
+                keyword, val = col
+                if keyword not in keywords:
+                    raise Exception(f"functionerror: unsupported function used")
+                cur_token.append(keyword)
+                cur_token += self.normalize_col(val)
+            else:
+                cur_token = [None] + self.normalize_col(col)
+            norm_tokens.append(tuple(cur_token))
+        return norm_tokens
+
+    def normalize_where(self, tokens: list, tables: list) -> list:
+        """Normalize the where and add relevant tables as well
+
+        :param tokens: list -> list of basic tokens
+        :param tables: list -> list of tables
+        :return norm_tokens: list -> list of normalized table names
+        """
+        norm_tokens = []
+        for token in tokens['conditions']:
+            cur_token = token
+            cur_token['lhs'] = self.normalize_col(token['lhs'])
+            if token['type'] == 'JOIN':
+                cur_token['rhs'] = self.normalize_col(token['rhs'], True)
+            norm_tokens.append(cur_token)
+        tokens['conditions'] = norm_tokens
+        return tokens
+
+    def gen_result(self, fields: list, where: dict, dataset: list, tables: list) -> str:
+        """Generate the final result query
+
+        :param fields: list -> list of normalized fields
+        :param where: None or dict -> where condition to process
+        :param dataset: list -> dataset to process on
+        :return res: str -> final result
+        """
+        res = ""
+        queryset = {}
+        result = {}
+        for data_gp, table in zip(dataset, tables):
+            cols = self.meta[table]
+            queryset[table] = {col: [table + '.' + col] for col in cols}
+            for row in data_gp:
+                [queryset[table][col].append(val) for col, val in zip(cols, row)]
+        for field in fields:
+            keyword, table, col = field
+            base_col = queryset[table][col]
+            result['.'.join([table, col])] = base_col
+            if keyword == 'DISTINCT':
+                pass
+        return res
+
+    def filter_where(self, dataset: list, where: dict) -> list:
+        """Filter the where joins and reduce data size
+
+        :param dataset: list -> complete dataset
+        :param where: dict -> the where condition to be run
+        :return dataset: list -> reduced rows
+        """
+        new_data = []
+        new_data = dataset  # TODO: filter on the basis of conditionals
+        return new_data
 
     def compile_result(self, tokens: list) -> str:
         """Compile the results after verifying valid statement
@@ -223,7 +312,22 @@ class QueryParser(object):
         :return res: str -> Resulting formatted result depending on the query
         """
         res = ""
-        printj(tokens)
+        valid_tables = self.tables
+        idt = self.idt
+        tables, fields = tokens['tables'], tokens['fields']
+        fields = self.normalize_fields(fields, tables)
+        where = None
+        table_fetch = [self.tables.index(_) for _ in tables]
+        dialects = [(t_name, self.dialects[_]) for t_name, _ in zip(tables, table_fetch)]
+        readers = [csv.reader(open(t_name + '.csv'), dialect=dialect) for t_name, dialect in dialects]
+        dataset = list(map(lambda x: list(x), readers))
+        if 'where' in tokens:
+            where = self.normalize_where(tokens['where'], tables)
+            dataset = self.filter_where(dataset, where)
+        try:
+            res = self.gen_result(fields, where, dataset, tables)
+        except Exception as e:
+            print(f"dataerror: invalid query | {e}")
         return res
 
     def parse(self, query: sqlparse.sql.Statement) -> str:
