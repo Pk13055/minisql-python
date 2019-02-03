@@ -110,6 +110,54 @@ class QueryParser(object):
             tokens = []
         return tokens
 
+    @staticmethod
+    def parse_joins(joins: list) -> list:
+        """Parse join logicals
+        :param joins: list -> Keyword joins
+        :return tokens: list -> simplified joins
+        """
+        join_tk = [_.normalized for _ in joins if _.ttype == sqlparse.tokens.Keyword]
+        tokens = []
+        if len(join_tk) == len(joins):
+            tokens = join_tk
+        else:
+            raise Exception(f"joinerror: invalid logical used for joining")
+        return tokens
+
+    def parse_conditions(self, tokens: list) -> list:
+        """Parses individual conditions for comparisons
+        :param tokens: list of comparison tokens
+        :return simple_tokens: list -> basic set of comparisons. Each object
+            has a standard format
+            [
+                {
+                    'type' : 'COMP' OR 'NUM'
+                    'lhs' : [None or 'table', 'col'],
+                    'rhs' : [None or 'table', 'col'] OR NUM,
+                    'op'  : 'LT', 'GT', 'EQ', 'LTE', 'GTE'
+                }, ...
+            ]
+        """
+        def parse_condition(token_st):
+            cur_token = {}
+            is_first = True
+            for token in token_st:
+                if token.ttype == sqlparse.tokens.Whitespace:
+                    continue
+                if token.ttype == sqlparse.tokens.Comparison:
+                    cur_token['op'] = token.normalized
+                elif isinstance(token, sqlparse.sql.Identifier):
+                    value = self.parse_col(token.normalized)
+                    cur_token['rhs' if 'lhs' in cur_token else 'lhs'] = value
+                    is_first = False
+                elif token.ttype in [sqlparse.tokens.Token.Literal.Number.Integer,
+                                     sqlparse.tokens.Token.Literal.Number.Float]:
+                    cur_token['rhs'] = float(token.normalized)
+            return cur_token
+
+        simple_comp = [parse_condition(token) for token in tokens]
+        return simple_comp
+
     def parse_where(self, base: list) -> list:
         """Parses the where section to extract join params
 
@@ -119,7 +167,14 @@ class QueryParser(object):
         that contains any possible comparisons
         """
         where_sec = {}
-        print(base)
+        tokens = [_ for _ in base if _.ttype != sqlparse.tokens.Whitespace][1:-1]
+        if len(tokens) < 4:
+            comparisons = tokens[::2]
+            joins = tokens[1::2]
+            where_sec['condtions'] = self.parse_conditions(comparisons)
+            where_sec['joins'] = self.parse_joins(joins)
+        else:
+            raise Exception("whereerror: unsupported where statement")
         return where_sec
 
     def analyze_tokens(self, base: list) -> dict:
@@ -178,7 +233,6 @@ class QueryParser(object):
         :param query: sqlparse statment -> The query to be parsed
         :return result: str -> the record result to be parsed
         """
-        # TODO: add query parsing here (only select statements supported)
         res = ""
 
         # Note: self.query and res contain the result and query that
